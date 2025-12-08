@@ -190,6 +190,7 @@ class AgentModeDaemon:
         self._total_tasks_queued = 0
         self._completed_rollouts_v0: Dict[str, RolloutLegacy] = {}
         self._task_id_to_original_sample: Dict[str, Dict[str, Any]] = {}
+        self._rollout_enqueued_at: Dict[str, float] = {}
         self._server_thread: Optional[threading.Thread] = None
         self._proxy_thread: Optional[threading.Thread] = None
         self.is_train = True
@@ -401,6 +402,7 @@ class AgentModeDaemon:
 
                     # Store original sample data to reconstruct batch information later
                     self._task_id_to_original_sample[rollout_id] = original_sample
+                    self._rollout_enqueued_at[rollout_id] = time.time()
                     self._total_tasks_queued += 1
                 else:
                     # Collect tasks to enqueue in batch and queue them later
@@ -427,6 +429,8 @@ class AgentModeDaemon:
                     for rollout in rollouts
                 }
             )
+            now = time.time()
+            self._rollout_enqueued_at.update({rollout.rollout_id: now for rollout in rollouts})
             self._total_tasks_queued += len(rollouts)
 
     def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
@@ -450,18 +454,40 @@ class AgentModeDaemon:
             raise
 
     def _validate_data(self, rollout: RolloutLegacy):
-        if rollout.final_reward is None:
-            print(
-                f"Warning: Reward is None for rollout {rollout.rollout_id}, will be auto-set to {self.reward_fillna_value}."
-            )
         if rollout.triplets is None:
+            rollout.triplets = []
             print(f"Warning: Triplet is None for rollout {rollout.rollout_id}.")
-        elif len(rollout.triplets) == 0:
+
+        cleaned_triplets = []
+        dropped_triplets = []
+        for triplet in rollout.triplets:
+            prompt_ids = triplet.prompt.get("token_ids", [])
+            response_ids = triplet.response.get("token_ids", [])
+            if prompt_ids and response_ids:
+                cleaned_triplets.append(triplet)
+            else:
+                dropped_triplets.append(triplet)
+
+        if dropped_triplets:
+            print(
+                "Warning: Dropping %d triplets with empty prompt or response for rollout %s." % (
+                    len(dropped_triplets), rollout.rollout_id
+                )
+            )
+        rollout.triplets = cleaned_triplets
+
+        if len(rollout.triplets) == 0:
             print(f"Warning: Length of triplets is 0 for rollout {rollout.rollout_id}.")
-        elif any(not r.response.get("token_ids", []) for r in rollout.triplets):
-            print(f"Warning: Rollout {rollout.rollout_id} contains empty response: {rollout.triplets}")
-        elif any(not r.prompt.get("token_ids", []) for r in rollout.triplets):
-            print(f"Warning: Rollout {rollout.rollout_id} contains empty prompt: {rollout.triplets}")
+
+        if rollout.final_reward is None:
+            for triplet in reversed(rollout.triplets):
+                if triplet.reward is not None:
+                    rollout.final_reward = triplet.reward
+                    break
+            if rollout.final_reward is None:
+                print(
+                    f"Warning: Reward is None for rollout {rollout.rollout_id}, will be auto-set to {self.reward_fillna_value}."
+                )
 
     async def _validate_data_v1(self, rollout: Rollout) -> RolloutLegacy:
         """Convert Rollout to RolloutLegacy and validate.
@@ -514,6 +540,12 @@ class AgentModeDaemon:
 
     async def _async_run_until_finished(self, verbose: bool = True):
         """Async helper to wait for all tasks to complete."""
+        last_completed_count = -1
+        last_progress_logged_count = -1
+        last_progress_log_time = 0.0
+        stalled_since: float | None = None
+        timeout_cutoff = self.llm_timeout_seconds + 60.0
+
         while len(self._completed_rollouts_v0) < self._total_tasks_queued:
             if self.mode == "v0":
                 completed_batch = await self.server.retrieve_completed_rollouts()
@@ -533,8 +565,69 @@ class AgentModeDaemon:
                     print(f"Warning: Received unknown rollout ID {rollout.rollout_id}, skipping.")
                 else:
                     self._completed_rollouts_v0[rollout.rollout_id] = rollout
+            now = time.time()
+            # Identify rollouts that exceeded the timeout and mark them as dropped.
+            timed_out_rollouts = []
+            for rollout_id in set(self._task_id_to_original_sample.keys()) - set(
+                self._completed_rollouts_v0.keys()
+            ):
+                enqueue_time = self._rollout_enqueued_at.get(rollout_id)
+                if enqueue_time is None:
+                    continue
+                if now - enqueue_time > timeout_cutoff:
+                    timed_out_rollouts.append((rollout_id, now - enqueue_time))
+
+            for rollout_id, waited in timed_out_rollouts:
+                original_sample = self._task_id_to_original_sample.get(rollout_id, {})
+                reason = f"timed out after waiting {int(waited)}s (limit={int(timeout_cutoff)}s)"
+                print(
+                    f"Warning: Rollout {rollout_id} {reason}; marking as dropped so training can continue."
+                )
+                dropped_task = Task(
+                    rollout_id=rollout_id,
+                    input=original_sample,
+                    metadata={"timeout_reason": reason},
+                )
+                self._completed_rollouts_v0[rollout_id] = RolloutLegacy(
+                    rollout_id=rollout_id,
+                    task=dropped_task,
+                    final_reward=self.reward_fillna_value,
+                    triplets=[],
+                    metadata={"timeout_reason": reason},
+                )
+
             if verbose:
-                print(f"Completed {len(self._completed_rollouts_v0)}/{self._total_tasks_queued} tasks...")
+                current_completed = len(self._completed_rollouts_v0)
+                if (
+                    current_completed != last_progress_logged_count
+                    or now - last_progress_log_time >= 60
+                ):
+                    pending = self._total_tasks_queued - current_completed
+                    suffix = "" if pending <= 0 else f" (still waiting on {pending})"
+                    print(
+                        f"Completed {current_completed}/{self._total_tasks_queued} tasks...{suffix}"
+                    )
+                    last_progress_logged_count = current_completed
+                    last_progress_log_time = now
+
+            # If progress stalls, emit the pending rollout IDs to aid debugging.
+            if last_completed_count == len(self._completed_rollouts_v0):
+                stalled_since = stalled_since or time.time()
+                stalled_duration = time.time() - stalled_since
+                if stalled_duration >= 60:
+                    pending_ids = list(
+                        set(self._task_id_to_original_sample.keys())
+                        - set(self._completed_rollouts_v0.keys())
+                    )
+                    pending_preview = pending_ids[:5]
+                    print(
+                        f"Still waiting on {len(pending_ids)} rollout(s) after {int(stalled_duration)}s: "
+                        f"{pending_preview}{'...' if len(pending_ids) > len(pending_preview) else ''}"
+                    )
+                    stalled_since = time.time()
+            else:
+                stalled_since = None
+                last_completed_count = len(self._completed_rollouts_v0)
             await asyncio.sleep(5)
 
         print("All tasks finished.")
@@ -710,8 +803,21 @@ class AgentModeDaemon:
         for rollout_id, sample_info in finished_id_to_sample_info.items():
             for turn_index, trace in enumerate(sample_info["trace_list"]):
 
-                reward_list.append(sample_info["reward"])
                 prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
+
+                if not prompt_ids:
+                    print(
+                        f"Warning: Empty prompt tokens for rollout {rollout_id} turn {turn_index}, skipping this trace."
+                    )
+                    continue
+
+                if not response_ids:
+                    print(
+                        f"Warning: Empty response tokens for rollout {rollout_id} turn {turn_index}, skipping this trace."
+                    )
+                    continue
+
+                reward_list.append(sample_info["reward"])
 
                 # Mark samples with prompts exceeding max_prompt_length to be dropped later
                 if len(prompt_ids) > max_prompt_length:
@@ -799,6 +905,7 @@ class AgentModeDaemon:
         self.backend_llm_server_addresses = []
         self._completed_rollouts_v0.clear()
         self._task_id_to_original_sample.clear()
+        self._rollout_enqueued_at.clear()
         self._total_tasks_queued = 0
         # For a true reset, the server's internal queues would also need clearing.
         # This implementation assumes that `set_up_data_and_server` is called
