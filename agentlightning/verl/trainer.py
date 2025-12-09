@@ -226,6 +226,10 @@ class AgentLightningTrainer(RayPPOTrainer):
                 self.agent_mode_daemon.clear_data_and_server()
                 self.async_rollout_manager.sleep()
 
+            if batch is None:
+                metrics["training/step_skipped_no_traces"] = 1
+                return metrics
+
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)

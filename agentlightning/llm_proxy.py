@@ -223,6 +223,7 @@ class LightningSpanExporter(SpanExporter):
         self._loop_thread: Optional[threading.Thread] = None
 
         self._otlp_exporter = OTLPSpanExporter()
+        self._otlp_export_failed_once: bool = False
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         """Lazily initialize the event loop and thread on first use.
@@ -421,12 +422,27 @@ class LightningSpanExporter(SpanExporter):
                             }
                         )
                     )
-                export_result = self._otlp_exporter.export(subtree_spans)
-                if export_result != SpanExportResult.SUCCESS:
-                    raise RuntimeError(f"Failed to export spans via OTLP exporter. Result: {export_result}")
+                export_result: SpanExportResult | None = None
+                failure_reason: str | None = None
+                try:
+                    export_result = self._otlp_exporter.export(subtree_spans)
+                except Exception as exc:  # pragma: no cover - network failure handling
+                    export_result = SpanExportResult.FAILURE
+                    failure_reason = f"{type(exc).__name__}: {exc}"
 
-            else:
-                # The old way: store does not support OTLP endpoint
+                if export_result != SpanExportResult.SUCCESS:
+                    reason = failure_reason or f"result={export_result}"
+                    if not self._otlp_export_failed_once:
+                        logger.warning(
+                            "OTLP export to %s failed (%s); falling back to store.add_otel_span.",
+                            otlp_traces_endpoint,
+                            reason,
+                        )
+                        self._otlp_export_failed_once = True
+                    otlp_enabled = False
+
+            if not otlp_enabled:
+                # Fallback: store does not support OTLP endpoint or exporter unreachable
                 for span in subtree_spans:
                     loop = self._ensure_loop()
                     add_otel_span_task = store.add_otel_span(
