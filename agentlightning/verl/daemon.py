@@ -140,6 +140,7 @@ class AgentModeDaemon:
         pad_token_id: int,
         reward_fillna_value: float = 0.0,
         llm_timeout_seconds: float = 1200.0,
+        max_stall_seconds: float | None = None,
         mode: Literal["v0", "v1"] = "v1",
         llm_proxy: LLMProxy | None = None,
         store: LightningStore | None = None,
@@ -147,6 +148,12 @@ class AgentModeDaemon:
     ):
         self.mode = mode
         self.llm_timeout_seconds = llm_timeout_seconds
+        # If the model never returns, avoid blocking an entire training step for the
+        # full llm_timeout_seconds window. Default to a 5 minute stall cutoff, capped
+        # at the LLM timeout so we never time out sooner than the LLM would.
+        self.max_stall_seconds = (
+            min(llm_timeout_seconds, 300.0) if max_stall_seconds is None else max_stall_seconds
+        )
 
         # Server and Task Configuration
         if mode == "v0":
@@ -625,6 +632,44 @@ class AgentModeDaemon:
                         f"{pending_preview}{'...' if len(pending_ids) > len(pending_preview) else ''}"
                     )
                     stalled_since = time.time()
+
+                # If no progress has been made for an extended period, proactively
+                # drop all pending rollouts so the step can continue instead of
+                # waiting for the full task timeout window.
+                if (
+                    self.max_stall_seconds is not None
+                    and stalled_duration >= self.max_stall_seconds
+                ):
+                    pending_ids = list(
+                        set(self._task_id_to_original_sample.keys())
+                        - set(self._completed_rollouts_v0.keys())
+                    )
+                    if pending_ids:
+                        print(
+                            "Warning: No rollouts have finished for "
+                            f"{int(stalled_duration)}s; marking {len(pending_ids)} pending "
+                            "rollout(s) as timed out so training can continue."
+                        )
+                        for rollout_id in pending_ids:
+                            original_sample = self._task_id_to_original_sample.get(rollout_id, {})
+                            reason = (
+                                f"stalled for {int(stalled_duration)}s without progress; "
+                                f"max_stall_seconds={int(self.max_stall_seconds)}"
+                            )
+                            dropped_task = Task(
+                                rollout_id=rollout_id,
+                                input=original_sample,
+                                metadata={"timeout_reason": reason},
+                            )
+                            self._completed_rollouts_v0[rollout_id] = RolloutLegacy(
+                                rollout_id=rollout_id,
+                                task=dropped_task,
+                                final_reward=self.reward_fillna_value,
+                                triplets=[],
+                                metadata={"timeout_reason": reason},
+                            )
+                        # Reset stall tracking so we don't immediately repeat.
+                        stalled_since = time.time()
             else:
                 stalled_since = None
                 last_completed_count = len(self._completed_rollouts_v0)
@@ -739,13 +784,20 @@ class AgentModeDaemon:
         )
         return metric_dict
 
-    def get_train_data_batch(self, max_prompt_length: int, max_response_length: int, device: torch.device):
+    def get_train_data_batch(
+        self, max_prompt_length: int, max_response_length: int, device: torch.device
+    ) -> Tuple[Optional[DataProto], dict]:
         """
         Processes completed rollouts to generate a training data batch.
 
         This function reconstructs the logic from the original AgentModeDaemon,
         using data retrieved from the new server architecture. It handles padding,
         truncation, and tensor creation for the PPO training loop.
+
+        Returns:
+            A tuple of (DataProto | None, metrics). When all traces are dropped or empty
+            after filtering, returns (None, metrics) so the caller can skip the step
+            gracefully.
         """
         assert self.is_train, "This method should only be called during training."
         assert len(self._completed_rollouts_v0) == self._total_tasks_queued
@@ -848,6 +900,24 @@ class AgentModeDaemon:
                 turn_index_list.append(turn_index)
 
         n_transition = len(input_ids_list)
+
+        reward_values = list(finished_id_to_final_reward.values())
+        data_metrics = {
+            "training/reward": float(np.mean(reward_values)) if reward_values else 0.0,
+            "training/n_rollouts": len(finished_id_to_final_reward),
+            "training/n_rollouts_w_trace": len(finished_id_to_sample_info),
+            "training/n_rollouts_w_reward": sample_with_reward_count,
+            "training/n_truncated_triplets": n_trunc_sample_because_of_response,
+            "training/n_triplets": n_transition,
+        }
+
+        if n_transition == 0:
+            print(
+                "Warning: No valid traces found after filtering (all rollouts dropped or empty); "
+                "skipping this training batch."
+            )
+            return None, data_metrics
+
         batch_input_ids = torch.LongTensor(input_ids_list).to(device)
         input_attention_mask = torch.LongTensor(input_attention_mask_list).to(device)
         batch_response_ids = torch.LongTensor(response_ids_list).to(device)
@@ -883,15 +953,6 @@ class AgentModeDaemon:
             batch_size=n_transition,
         )
         data_proto = DataProto(batch=batch)
-
-        data_metrics = {
-            "training/reward": np.mean(list(finished_id_to_final_reward.values())),
-            "training/n_rollouts": len(finished_id_to_final_reward),
-            "training/n_rollouts_w_trace": len(finished_id_to_sample_info),
-            "training/n_rollouts_w_reward": sample_with_reward_count,
-            "training/n_truncated_triplets": n_trunc_sample_because_of_response,
-            "training/n_triplets": n_transition,
-        }
 
         # Add non-tensor data for advantage calculation and logging
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)  # type: ignore
